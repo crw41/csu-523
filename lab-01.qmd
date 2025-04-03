@@ -92,6 +92,7 @@ state_data %>%
   set_caption(paste("Top 5 ", my.state, 
                     " Counties Based on Cumulative COVID-19 Cases on ",
                     my.date))
+## Don't know why captions aren't showing up?
 ```
 
 ```{r}
@@ -452,7 +453,7 @@ cases_plot <- weighted_mean_coords %>%
   ) +
   coord_fixed(1.3) +
   theme_void() +
-  labs(title = "Weighted Mean Centers of COVID-19 Cases (Left) and Deaths (Right) Over Time") +
+  labs(title = "Weighted Mean Centers of COVID-19 Cases (Left) and Deaths (Right)") +
   theme(legend.position = "bottom")
 
 # Deaths plot
