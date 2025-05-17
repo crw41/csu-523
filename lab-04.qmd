@@ -1,0 +1,260 @@
+---
+title: "Lab 4: Remote Sensing for Flooding"
+subtitle: "Ecosystem Science and Sustainability 523C"
+author:
+  name: "Charlotte Wachter"
+  email: "crw41@colostate.edu"
+format: 
+  html: 
+    code-fold: true
+    toc: true
+---
+
+```{r}
+#| label: load-packages
+#| include: false
+
+# Libraries
+library(rstac) # STAC API
+library(terra) # Raster Data handling
+library(sf) # Vector data processing
+library(mapview) # Rapid Interactive visualization
+library(tidyverse)
+library(AOI)
+
+# Visualization
+library(flextable)
+library(gghighlight)
+library(ggrepel)
+library(knitr)
+library(patchwork)
+
+knitr::opts_chunk$set(fig.width = 6, 
+                      message = FALSE, 
+                      warning = FALSE, 
+                      comment = "", 
+                      cache = FALSE, 
+                      fig.retina = 3)
+```
+
+# **Background**
+```{r}
+# Step 1: AOI Identification
+palo <- AOI::geocode("Palo, Iowa", bbox = TRUE)
+
+# Step 2: Temporal Identification
+temporal_range <- "2016-09-24/2016-09-29"
+
+# Step 3: Identifying relevant images
+## Opening a connection to the MPC STAC API, finding Landsat 8 Level 2 dataset for our spatial and temporal extent, signing request
+(stac_query <- stac("https://planetarycomputer.microsoft.com/api/stac/v1") |> 
+  stac_search(
+    collections = "landsat-c2-l2",
+    datetime    = temporal_range,
+    bbox        = st_bbox(palo),
+    limit = 1) |> 
+  get_request() |> 
+  items_sign(sign_planetary_computer()))
+
+# Step 4: Downloading relevant images
+## Vector of assets we want
+bands <- c('coastal', 'blue', 'green', 'red', 'nir08', 'swir16')
+
+## Downloading assets
+assets_download(items = stac_query,
+                asset_names = bands, 
+                output_dir = 'lab-04-data', 
+                overwrite = TRUE)
+```
+
+# **Question 1:** Data Acquisition 
+```{r}
+# Creating raster object
+raster <- terra::rast(list.files('lab-04-data',
+                                 pattern = '.TIF$',
+                                 recursive = TRUE,
+                                 full.names = TRUE))
+
+# Setting band names
+raster <- setNames(raster, bands)
+
+# Looking at stacked image details
+(raster)
+```
+
+From the above output, we can see that the dimensions of the stacked image are 7801 x 7681 x 6 (six 7801 x 7681 images), the CRS of the stacked image is WGS 84 / UTM zone 15N, and the cell resolution (in meters) is 30 x 30.
+
+## ***Step 5:*** Analyze the images
+```{r}
+# Transforming AOI to CRS of landsat stack
+palo <- st_transform(palo, crs = st_crs(raster))
+
+# Cropping raster stack
+rast_palo <- terra::crop(raster, palo)
+```
+
+# **Question 2:** Image Creation
+```{r}
+# Plotting
+## Natural color
+par(mfrow = c(1,2))
+plotRGB(rast_palo, r = "red", g = "green", b = "blue", stretch = "lin", main = "Natural Color (lin)")
+plotRGB(rast_palo, r = "red", g = "green", b = "blue", stretch = "hist", main = "Natural Color (hist)")
+  
+# Infrared
+plotRGB(rast_palo, r = "nir08", g = "red", b = "green", stretch = "lin", main = "Infrared Color (lin)")
+plotRGB(rast_palo, r = "nir08", g = "red", b = "green", stretch = "hist", main = "Infrared Color (hist)")
+
+# False color water focus
+plotRGB(rast_palo, r = "nir08", g =  "swir16", b = "red", stretch = "lin", main = "False Color Water Focus (lin)")
+plotRGB(rast_palo, r = "nir08", g =  "swir16", b = "red", stretch = "hist", main = "False Color Water Focus (hist)")
+
+# False color crop focus
+plotRGB(rast_palo, r = "swir16", g =  "nir08", b = "red", stretch = "lin", main = "False Color Crop Focus (lin)")
+plotRGB(rast_palo, r = "swir16", g =  "nir08", b = "red", stretch = "hist", main = "False Color Crop Focus (hist)")
+```
+
+In each set of two images, the left image has the "lin" stretch option and the right image has the "hist" stretch option. Stretching with "hist" raises the brightness and contrast of the images, which allows us to more clearly discern different areas of interest. The first set of two images shows the images in their natural color. We can see that Palo, Iowa has crops, some forested areas, and a large river. The second set of images are in infrared color and clearly highlight the areas of Palo with more vegetation. These areas are primarily around the waterways. The third set of images are in false color with a focus on the waterways (rivver the flooding), which are depicted in blue. Finally, the fourth set of images highlights the crops surrounding Palo in a bright pink/purple color. I tested different bands in different channels and this combination was the most striking to me.
+
+# **Question 3:** Thresholding
+
+## ***Step 1:*** Raster Algebra
+```{r}
+# Creating 5 new rasters
+## NDVI (NIR - Red) / (NIR + Red)
+ndvi <- (rast_palo[["nir08"]] - rast_palo[["red"]]) / (rast_palo[["nir08"]] + rast_palo[["red"]])
+
+## NDWI (Green - NIR) / (Green + NIR)
+ndwi <- (rast_palo[["green"]] - rast_palo[["nir08"]]) / (rast_palo[["green"]] + rast_palo[["nir08"]])
+
+## MNDWI (Green - SWIR1) / (Green + SWIR1)
+mndwi <- (rast_palo[["green"]] - rast_palo[["swir16"]]) / (rast_palo[["green"]] + rast_palo[["swir16"]])
+
+## WRI (Green + Red) / (NIR + SWIR1)
+wri <- (rast_palo[["green"]] + rast_palo[["red"]]) / (rast_palo[["nir08"]] + rast_palo[["swir16"]])
+
+## SWI 1 / sqrt(Blue - SWIR1)
+swi <- (1 / sqrt(rast_palo[["blue"]] - rast_palo[["swir16"]]))
+
+# Combining into stacked object and setting names
+raster_stack <- c(ndvi, ndwi, mndwi, wri, swi)
+raster_stack <- setNames(raster_stack, c("NDVI", "NDWI", "MNDWI", "WRI", "SWI"))
+
+# Plotting stacked object
+plot(raster_stack, col = colorRampPalette(c("blue", "white", "red"))(256), main = names(raster_stack))
+```
+
+The five images all clearly highlight the surface water features in Palo (the Cedar River and flooded areas), but vary in terms of color and how the surrounding area (cropland and vegetation) are shown. The NDVI shows pixels that are likely surface water features in dark blue while the NDWI shows pixels that are likely surface water features in red. The MNDWI also shows pixels that are likely surface water features in red but distinguishes less between surface water features and vegetation, so this method depicts the areas with vegetation as more similar to the surface water features than cropland (opposite of first two images). Finally, the WRI more distinctly identifies the surface water features in dark red and other areas (cropland and vegetation) in dark blue while the SWI only depicts surface water features in dark blue and ignores everything else (likely calculated as NA values due to negative within square root of formula).
+
+## ***Step 2:*** Raster Thresholding
+```{r}
+# Applying thresholds
+ndvi_water <- app(ndvi, function(x) (ifelse(x < 0, 1, 0)))
+ndwi_water <- app(ndwi, function(x) (ifelse(x > 0, 1, 0)))
+mndwi_water <- app(mndwi, function(x) (ifelse(x > 0, 1, 0)))
+wri_water <- app(wri, function(x) (ifelse(x > 1, 1, 0)))
+swi_water <- app(swi, function(x) (ifelse(x < 5, 1, 0)))
+
+# Stacking and setting names
+water_stack <- c(ndvi_water, ndwi_water, mndwi_water, wri_water, swi_water)
+water_stack <- setNames(water_stack, c("NDVI", "NDWI", "MNDWI", "WRI", "SWI"))
+
+# Replacing all NA values with 0
+water_stack <- app(water_stack, fun = function(x) ifelse(is.na(x), 0, x))
+
+# Plotting stacked object
+plot(water_stack, col = c("white", "blue"), legend = FALSE, main = names(water_stack))
+```
+## ***Step 3***
+
+The maps are now very similar. The Cedar River is clearly identified as a water feature in all of the maps, but the identification of additional water cells (presumably flooding around the river, hence referred to as flooded cells) differs from map to map. The MNDWI and WRI rasters seem to identify the most flooded cells, while the SWI raster identifies the least. The NDVI and NDWI rasters idenify a level of flooding somewhere in between the MNDWI and SWI rasters and produce very similar maps.
+
+# **Question 4:** Classification
+
+## ***Steps 1 & 2***
+```{r}
+# Step 1: Setting seed
+set.seed(1234)
+
+# Step 2: Extracting values, checking dimensions, removing NA values
+vals <- values(rast_palo)
+dim(vals)
+vals <- na.omit(vals)
+```
+There are 12,192 rows and 6 columns, which correspond to the 12,192 raster cells in each band and the six bands themselves. This tells me that the data were extracted cell by cell for each band. 
+
+## ***Steps 3 & 4***
+```{r}
+# Step 3: Applying k-means with 12 clusters (and others to see how map changes)
+km_12 <- kmeans(vals, centers = 12)
+km_5 <- kmeans(vals, centers = 5)
+km_20 <- kmeans(vals, centers = 20)
+
+# Step 4: Creating raster from clustering
+km_12_raster <- rast_palo[[1]]
+km_12_raster[] <- km_12$cluster
+
+km_5_raster <- rast_palo[[1]]
+km_5_raster[] <- km_5$cluster
+
+km_20_raster <- rast_palo[[1]]
+km_20_raster[] <- km_20$cluster
+
+# Stacking and plotting
+km_raster <- c(km_5_raster, km_12_raster, km_20_raster)
+km_raster <- setNames(km_raster, c("k = 5", "k = 12", "k = 20"))
+plot(km_raster, main = names(km_raster))
+```
+
+# ***Step 5***
+```{r}
+# Building table
+tab <- table(values(ndwi_water), values(km_12_raster))
+
+# Identifying which cluster has the most overlap with flooded cells from NDWI raster
+flood_cluster <- which.max(tab[2, ])
+
+# Creating flood mask
+km_water <- app(km_12_raster, fun = function(x) ifelse(x == flood_cluster, 1, 0))
+
+# Adding to water stack and making new plot
+water_stack_final <- c(water_stack, km_water)
+water_stack_final <- setNames(water_stack_final, c("NDVI", "NDWI", "MNDWI", "WRI", "SWI", "K-means"))
+plot(water_stack_final, col = c("white", "blue"), legend = FALSE, main = names(water_stack_final))
+```
+
+# **Question 5:** Summary
+
+## ***Step 1:*** Caluclate total flooded area
+```{r}
+# Sum of flooded pixels
+flooded_cells <- global(water_stack_final, sum, na.rm = TRUE)
+
+# Converting to area using cell resolution (30m x 30m = 900m^2)
+flooded_area_m2 <- flooded_cells*900
+
+# Printing
+print(flooded_area_m2)
+```
+
+## ***Step 2:*** Visualizing classification agreement
+```{r}
+# Summing all rasters
+flood_agreement <- app(water_stack_final, fun = sum)
+
+# Plotting
+plot(flood_agreement, col = RColorBrewer::brewer.pal(9, "Blues"), main = "Flood Agreement (0-6)")
+```
+
+## ***Step 3:*** Mapping with mapview
+```{r}
+# Masking 0s
+flood_agreement_final <- classify(flood_agreement, cbind(0, NA))
+
+# Plotting
+mapview(flood_agreement_final,
+        col.regions = RColorBrewer::brewer.pal(9, "Blues"),
+        layer.name = "Flood Agreement Score")
+```
+
+I'm not sure why some of the cell values are not even numbers. When we summed the water stack, the input rasters should've all had binary values and should've been perfectly aligned with the same resolution. If the input rasters were not perfectly aligned or had slightly different resolutions, it would explain why some cells aren't integers (R automatically interpolates values to match grids). Another explanation would be that the edge pixels were averaged during the sum operation, but it's not clear to me that this is the case. 

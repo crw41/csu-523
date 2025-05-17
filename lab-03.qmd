@@ -1,0 +1,373 @@
+---
+title: "Lab 3: Tessellations, Point-in-Polygon"
+subtitle: "Ecosystem Science and Sustainability 523C"
+author:
+  name: "Charlotte Wachter"
+  email: "crw41@colostate.edu"
+format: 
+  html: 
+    code-fold: true
+    toc: true
+---
+
+```{r}
+#| label: load-packages
+#| include: false
+
+# Spatial data science
+library(tidyverse)
+library(sf)
+library(units)
+library(AOI)
+library(rmapshaper)
+library(mapview)
+
+# Data
+library(USAboundaries)
+library(rnaturalearth)
+
+# Visualization
+library(flextable)
+library(gghighlight)
+library(ggrepel)
+library(knitr)
+library(kableExtra)
+library(leaflet)
+library(leafpop)
+
+knitr::opts_chunk$set(fig.width = 6, 
+                      message = FALSE, 
+                      warning = FALSE, 
+                      comment = "", 
+                      cache = FALSE, 
+                      fig.retina = 3)
+```
+
+# **Question 1**: Tesselations
+
+## ***Steps 1.1-1.5***
+```{r}
+#| message: FALSE
+
+# Step 1.1: Getting sf object of counties, transforming
+counties <- AOI::aoi_get(state = "conus", county = "all") %>%
+  st_transform(crs = 5070)
+
+# Step 1.2: Generating county centroids, combining to MULTIPOINT feature
+centroids <- st_centroid(counties) %>%
+  st_union()
+
+# Step 1.3: Tessellations/Coverages
+## Voronoi Tessellation
+v_tess <- st_voronoi(centroids) %>%
+  st_cast() %>%
+  st_as_sf() %>%
+  mutate(id = 1:n())
+
+## Triangulated Tessellation
+t_tess <- st_triangulate(centroids) %>%
+  st_cast() %>%
+  st_as_sf() %>%
+  mutate(id = 1:n())
+
+## Gridded Coverage
+grid <- st_make_grid(counties, n = 70) %>%
+  st_cast() %>%
+  st_as_sf() %>%
+  mutate(id = 1:n())
+
+## Hexagonal Coverage
+hex <- st_make_grid(counties, n = 70, square = FALSE) %>%
+  st_cast() %>%
+  st_as_sf() %>%
+  mutate(id = 1:n())
+
+# Step 1.4: Unioning county boundaries to get geometry of CONUS
+conus <- st_union(counties) 
+
+# Step 1.5: Simplifying CONUS border, cropping tessellations
+## removing 95%, 99% of points
+conus5 <- ms_simplify(conus, keep = 0.05)
+conus1 <- ms_simplify(conus, keep = 0.01)
+
+## plotting
+c5 <- ggplot() +
+  geom_sf(data = conus5)
+c1 <- ggplot() + 
+  geom_sf(data = conus1)
+
+library(patchwork)
+c5 + c1
+
+## for this project, I'm comfortable with removing 99% of the points because this greatly simplifies the coastal borders without removing any of the county information (only island counties are in AK and HI) and will make computationally easier to crop the tessellations to the CONUS border. 
+
+## Reporting number of points
+mapview::npts(conus)
+mapview::npts(conus1)
+```
+
+There were 11,292 points in the original unioned border. After simplifying the unioned border, there are 114 points, so 11,178 points were removed. This greatly simplifies the coastal borders. Consequently, this will speed up the computation time as fewer points means that less computations are required when we perform spatial tasks (like st_intersection).
+
+## ***Steps 1.5 (continued)***
+```{r}
+# Step 1.5: Simplifying CONUS border, cropping tessellations (continued)
+
+## Cropping the voronoi tessellation
+v_tess_cropped <- st_intersection(v_tess, conus1)
+
+## Comparing old (left) and cropped (right)
+v1 <- ggplot() +
+  geom_sf(data = v_tess)
+v2 <- ggplot() + 
+  geom_sf(data = v_tess_cropped)
+
+v1 + v2 # looks good!
+
+## Cropping triangulated tessellation
+t_tess_cropped <- st_intersection(t_tess, conus1)
+
+## Comparing old (left) and cropped (right)
+t1 <- ggplot() +
+  geom_sf(data = t_tess)
+t2 <- ggplot() + 
+  geom_sf(data = t_tess_cropped)
+
+t1 + t2 # looks good!
+```
+
+## ***Steps 1.6-1.7***
+```{r}
+# Step 1.6: Function to plot tessellations, coverages, counties
+plot_surface = function(obj, plot_title) {
+  ggplot() +
+    geom_sf(data = obj, fill = "white", color = "navy", size = 0.2) +
+    theme_void() +
+    labs(title = plot_title, caption = paste("This tessellation has:", nrow(obj), "tiles."))
+}
+
+# Original U.S. Counties
+plot_surface(obj = counties, "Raw U.S. Counties")
+
+# Voronoi Tessellation
+plot_surface(obj = v_tess_cropped, "Voronoi Tessellation")
+
+# Triangulated Tessellation
+plot_surface(obj = t_tess_cropped, "Triangulated Tessellation")
+
+# Gridded Coverage
+plot_surface(obj = grid, "Gridded Coverage")
+
+# Hexagonal Coverage 
+plot_surface(hex, "Hexagonal Coverage")
+```
+
+# **Question 2**: Tessellation Comparison
+
+## ***Steps 2.1-2.4***
+```{r}
+# Step 2.1: Function that takes sf_object and character string and returns a data.frame
+summarize_sf = function(obj, name) {
+  # Calculate area
+  area <- st_area(obj) %>%
+    set_units("km^2") %>%
+    drop_units()
+  
+  # Create data.frame
+  df <- data.frame(name, nrow(obj), mean(area), sd(area), sum(area)) 
+  colnames(df) <- c("Name", "Number of Features", "Mean", "SD", "Total Area (km^2)")
+  
+  # Return data.frame
+  return(df)
+}
+
+# Step 2.2: Summarize tessellations and counties
+counties_sum <- summarize_sf(obj = counties, name = "Raw U.S. Counties")
+v_tess_sum <- summarize_sf(obj = v_tess_cropped, name = "Voronoi Tessellation")
+t_tess_sum <- summarize_sf(obj = t_tess_cropped, name = "Triangulated Tessellation")
+grid_sum <- summarize_sf(obj = grid, name = "Gridded Coverage")
+hex_sum <- summarize_sf(obj = hex, name = "Hexangonal Coverage")
+
+# Step 2.3: Bind summaries
+summary_df <- bind_rows(counties_sum, v_tess_sum, t_tess_sum, grid_sum, hex_sum)
+
+# Step 2.4: Print nice table
+summary_df %>%
+  kable("html", caption = "Summarizing Surfaces") %>%
+  add_header_above(c(" " = 2, "Feature Area (km^2)" = 2, " " = 1)) %>%
+  kable_styling(full_width = F, position = "center")
+```
+
+## ***Step 2.5***
+
+The gridded and hexagonal coverages divide the surface into equal area grid cells and hexagons, respectively. In the context of a point-in-polygon (PIP) analysis, these coverages will require more computational power than the voronoi tessellation and the raw county polygons, but less computational power than the triangulated tessellation. Although the gridded and hexagonal coverages are similar, they will produce slightly different analyses since the shape and size of the tiles are different (this is the modifiable areal unit problem, MAUP). The tiles also extend outside CONUS boundaries, so any PIP analysis that considers the distribution of counts/tile will be biased by the tiles outside CONUS (assuming all data points are within CONUS). Next, the triangulated tessellation has the most features and the smallest average feature area, which implies that spatial operations on this tessellation will be the most computationally intensive. The map of the triangulated tessellation also shows that the tiles around the coast and the southwestern U.S. are much larger than the other tiles, so results of a PIP analysis would likely be greatly influenced by MAUP as any average value would effectively weight the western/coastal features more heavily. Finally, the voronoi tessellation has the same number of features as the raw U.S. counties file, with similar mean feature area and lower standard deviation. The results from a PIP analysis would still be impacted by MAUP, since there is variation in feature size and shape, but I would expect the PIP analysis with the voronoi tessellation to be the most similar to the PIP analysis with the raw county features (which would still be impacted by MAUP).
+
+# **Question 3**: PIP
+
+## ***Steps 3.1-3.5***
+```{r}
+# Step 3.1: Reading in dam data, preparing for analysis
+## Reading in raw data, cleaning
+dams <- read_csv("lab-03-data/NID2019_U.csv") 
+
+## Cleaning, transforming to sf object, adding coordinates, keeping obs within CONUS
+dams_sf <- dams %>% 
+  filter(!is.na(LATITUDE)) %>%
+  st_as_sf(coords = c("LONGITUDE", "LATITUDE"), crs = 4236) %>%
+  st_transform(crs = 5070) %>%
+  st_filter(conus)
+
+# Step 3.2: Point-in-polygon function
+point_in_polygon = function(points, polygons, id_col) {
+  # Counting points in polygons
+  joined_sf <- st_join(points, polygons) %>%
+    group_by({{ id_col }}) %>%
+    summarise(n = n()) %>%
+    st_drop_geometry()
+  
+  # Merging with input sf, replacing NAs (no points in polygon) with 0
+  final_sf <- left_join(polygons, joined_sf, by = join_by({{ id_col }})) %>%
+    mutate(n = replace_na(n, 0))
+}
+
+# Step 3.3: Applying function
+## Adding id col to counties
+counties <- counties %>% 
+  mutate(id = 1:n())
+
+## Applying function
+counties_dams <- point_in_polygon(points = dams_sf, polygons = counties, id_col = id)
+v_tess_dams <- point_in_polygon(points = dams_sf, polygons = v_tess_cropped, id_col = id)
+t_tess_dams<- point_in_polygon(points = dams_sf, polygons = t_tess_cropped, id_col = id)
+grid_dams <- point_in_polygon(points = dams_sf, polygons = grid, id_col = id)
+hex_dams <- point_in_polygon(points = dams_sf, polygons = hex, id_col = id)
+
+# Step 3.4: Extending plotting function
+plot_pip_counts <- function(obj, plot_title) {
+  
+  # plot
+  ggplot() +
+    geom_sf(data = obj, aes(fill = n), color = NA) +
+    scale_fill_viridis_c(name = "N Dams") +
+    theme_void() +
+    labs(title = plot_title, caption = paste("There are", sum(obj$n), "total dams."))
+}
+
+# Step 3.5: Applying plotting function
+# Original U.S. Counties
+plot_pip_counts(obj = counties_dams, "U.S. Counties Colored by Number of Dams")
+
+# Voronoi Tessellation
+plot_pip_counts(obj = v_tess_dams, "Voronoi Tessellation Tiles Colored by Number of Dams")
+
+# Triangulated Tessellation
+plot_pip_counts(obj = t_tess_dams, "Triangulated Tessellation Tiles Colored by Number of Dams")
+
+# Gridded Coverage
+plot_pip_counts(obj = grid_dams, "Gridded Coverage Tiles Colored by Number of Dams")
+
+# Hexagonal Coverage 
+plot_pip_counts(hex_dams, "Hexagonal Coverage Tiles Colored by Number of Dams")
+```
+
+## ***Step 3.6***
+
+When we compare the point in polygons dam plots, we can see that the gridded and hexagonal coverages result in similar plots with high numbers of dams per tile in the central and eastern U.S. This pattern is also observable in the county plot, but because of how the counties are shaped, there is a higher count of dams in Montana and this immediately stands out. Finally, the voronoi and triangulated tessellations produce plots similar to the counties plot, but it is harder to see the central and eastern patterns in the triangulated tessellation. This exercise exemplifies the MAUP problem as all plots use the same underlying dam points, but aggregate up to different spatial areas and therefore produce visually distinct results. Moving forward, I chose to use the voronoi tessellation. I chose this over the gridded and hexagonal coverages as I wanted some of the county-level information (the total # of tiles) to inform future analyses, and I chose this tessellation over the triangulated tessellation because it doesn't split the surface into as many areas (total # of tiles in voronoi = total # of counties) and the dam plots are more comparable to both the county-level plot and the gridded and hexagonal plots. Therefore, the voronoi tesselation keeps enough information from to illustrate the overall trends without introducing too much bias from unneccessarily splitting the surface.
+
+# **Question 4**: Conditional PIP
+
+## ***Steps 4.1-***
+```{r}
+# Step 4.1: Filtering for purposes, applying point in polygon function
+## Flood control
+dams_c <- dams_sf %>% 
+  filter(grepl("C", PURPOSES) == TRUE)
+pip_c <- point_in_polygon(points = dams_c, polygons = v_tess_cropped, id_col = id)
+
+## Water supply
+dams_s <- dams_sf %>% 
+  filter(grepl("S", PURPOSES) == TRUE)
+pip_s <- point_in_polygon(points = dams_s, polygons = v_tess_cropped, id_col = id)
+  
+# Debris control
+dams_d <- dams_sf %>% 
+  filter(grepl("D", PURPOSES) == TRUE)
+pip_d <- point_in_polygon(points = dams_d, polygons = v_tess_cropped, id_col = id)
+
+# Tailings
+dams_t <- dams_sf %>% 
+  filter(grepl("T", PURPOSES) == TRUE)
+pip_t <- point_in_polygon(points = dams_t, polygons = v_tess_cropped, id_col = id)
+
+# Irrigation
+dams_i <- dams_sf %>% 
+  filter(grepl("I", PURPOSES) == TRUE)
+pip_i <- point_in_polygon(points = dams_i, polygons = v_tess_cropped, id_col = id)
+```
+
+I chose to look dams that are used for flood control and storm water management (C), water supply (S), debris control (D), tailings (T), and irrigation (I). I chose to look at this subset of dams because I am interested in environmental threats to drinking water quality, including mine tailings, flooding events, and upstream debris, and I'm curious about correlations between the geographic distributions of these dams. Finally, I also included dams used for irrigation because there are less stringent water quality requirements for agricultural irrigation, so irrigation dams might be more likely to serve dual purposes like flood control, debris control, and mine tailing containment. 
+
+## ***Steps 4.2 & 4.3***
+```{r}
+# Plotting using plotting function from Q3
+## Flood control
+plot_pip_counts(obj = pip_c, "Flood Control and Stormwater Management") +
+  gghighlight(n > mean(pip_c$n) + sd(pip_c$n))
+
+## Water Supply
+plot_pip_counts(obj = pip_s, "Water Supply") +
+  gghighlight(n > mean(pip_s$n) + sd(pip_s$n))
+
+## Debris Control
+plot_pip_counts(obj = pip_d, "Debris Control") +
+  gghighlight(n > mean(pip_d$n) + sd(pip_d$n))
+
+## Tailings
+plot_pip_counts(obj = pip_t, "Tailings") +
+  gghighlight(n > mean(pip_t$n) + sd(pip_t$n))
+
+## Irrigation
+plot_pip_counts(obj = pip_i, "Irrigation") +
+  gghighlight(n > mean(pip_i$n) + sd(pip_i$n))
+```
+
+The geographic distributions of dams varies by purpose. For example, there is a higher concentration of dams used for flood control and storm water management in the midwest while dams used to contain/manage mine tailings are more concentrated in two regions; the west and the east along the corridor from Ohio to Florida. There doesn't seem to be any obvious correlations between water supply dams and dams of other purposes. My findings could be impacted by my choice of the voronoi tessellation as tiles in the western U.S. are larger than tiles in the eastern U.S.. I think that the voronoi tessellation is still a reasonable choice since dam construction and funding likely vary by region, maybe even at the county level, so including some information about county location within our analysis is beneficial. Regional variation in water history, water use, and climate also help explain some of the geographic distribution of dams, specifically dams used for irrigation and water supply as many western states rely on annual snow melt for water and allocate this water through complex agreements, like the Colorado River Compact. 
+
+# **Question 5:** Dam Age
+```{r}
+# Reading in river shapefile, filtering, transforming
+ms_river <- read_sf("lab-03-data/MajorRivers.shp") %>%
+  filter(SYSTEM == "Mississippi") %>%
+  st_transform(crs = 4326)
+
+# Filtering dams
+largest_dams <- dams_sf %>%
+  filter(HAZARD == "H") %>%
+  group_by(STATE) %>%
+  slice_max(order_by = NID_STORAGE, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  st_transform(crs = 4326)
+
+# Popup table
+popup_table <- largest_dams %>%
+  st_drop_geometry() %>%
+  select(DAM_NAME, NID_STORAGE, PURPOSES, YEAR_COMPLETED)
+popup_html <- leafpop::popupTable(popup_table, row.numbers = FALSE, feature.id = FALSE)
+
+# Mapping
+leaflet() %>%
+  addTiles() %>%
+  addCircleMarkers(
+    data = largest_dams,
+    radius = ~(NID_STORAGE / 1500000),
+    fillColor = "red",
+    fillOpacity = 1,
+    stroke = FALSE,
+    popup = popup_html
+  ) %>%
+  addPolylines(
+    data = ms_river,
+    color = "blue",
+    weight = 3,
+    opacity = 0.7
+  )
+```

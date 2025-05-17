@@ -1,0 +1,282 @@
+---
+title: "Lab 6: Poudre River Forecast"
+subtitle: "Ecosystem Science and Sustainability 523C"
+author:
+  name: "Charlotte Wachter"
+  email: "crw41@colostate.edu"
+format: 
+  html: 
+    code-fold: true
+    toc: true
+---
+
+```{r}
+#| label: load-packages
+#| include: false
+
+# Libraries
+library(dataRetrieval)
+library(climateR)
+library(terra)
+library(exactextractr)
+library(tidyverse)
+library(tidymodels)
+library(tsibble)
+library(modeltime)
+library(feasts)
+library(timetk)
+
+# Visualization
+library(plotly)
+library(flextable)
+
+knitr::opts_chunk$set(fig.width = 6, 
+                      message = FALSE, 
+                      warning = FALSE, 
+                      comment = "", 
+                      cache = FALSE, 
+                      fig.retina = 3)
+```
+
+# **Downloading Data**
+```{r}
+# Cache la Poudre River at Mouth (USGS site 06752260)
+poudre_flow <- readNWISdv(siteNumber = "06752260",    # Download data from USGS for site 06752260
+                          parameterCd = "00060",      # Parameter code 00060 = discharge in cfs)
+                          startDate = "2013-01-01",   # Set the start date
+                          endDate = "2023-12-31") |>  # Set the end date
+  renameNWISColumns() |>                              # Rename columns to standard names (e.g., "Flow", "Date")
+  mutate(Date = yearmonth(Date)) |>                   # Convert daily Date values into a year-month format (e.g., "2023 Jan")
+  group_by(Date) |>                                   # Group the data by the new monthly Date
+  summarise(Flow = mean(Flow))                       # Calculate the average daily flow for each month
+
+# Finding basin
+basin <- findNLDI(nwis = "06752260", find = "basin")
+
+# Climate data - GridMET
+sdate <- as.Date("2013-01-01")
+edate <- as.Date("2023-12-31")
+
+gm <- getTerraClim(AOI = basin$basin, 
+                             var = c("tmax", "ppt", "srad"), 
+                             startDate = sdate,   
+                             endDate = edate) |> 
+  unlist() |> 
+  rast() |> 
+  exact_extract(basin$basin, "mean", progress = FALSE)
+
+historic <- mutate(gm, id = "gridmet") |> 
+  pivot_longer(cols = -id) |> 
+  mutate(name = sub("^mean\\.", "", name)) %>%
+  tidyr::extract(name, into = c("var", "index"), "(.*)_([^_]+$)") |> 
+  mutate(index = as.integer(index)) |> 
+  mutate(Date = yearmonth(seq.Date(sdate, edate, by = "month")[as.numeric(index)])) |> 
+  pivot_wider(id_cols = Date, names_from = var, values_from = value) |> 
+  right_join(poudre_flow, by = "Date")
+
+# Climate data - MACA 
+sdate <- as.Date("2024-01-01")
+edate <- as.Date("2033-12-31")
+
+maca <- getMACA(AOI = basin$basin, 
+                var = c("tasmax", "pr", "rsds"), 
+                timeRes = "month",
+                startDate = sdate,   
+                endDate = edate) |> 
+  unlist() |> 
+  rast() |> 
+  exact_extract(basin$basin, "mean", progress = FALSE)
+
+future <- mutate(maca, id = "maca") |> 
+  pivot_longer(cols = -id) |> 
+  mutate(name = sub("^mean\\.", "", name))  |> 
+  tidyr::extract(name, into = c("var", "index"), "(.*)_([^_]+$)") |> 
+  mutate(index = as.integer(index)) |> 
+  mutate(Date = yearmonth(seq.Date(sdate, edate, by = "month")[as.numeric(index)])) |> 
+  pivot_wider(id_cols = Date, names_from = var, values_from = value) 
+
+names(future) <- c("Date", "ppt", "srad", "tmax")
+
+future <- mutate(future, tmax = tmax - 273.15)
+```
+
+# **Part 1:** Converting to table, plotting, analyzing seasonal patterns
+```{r}
+# Converting to tsibble
+historic_t <- as_tsibble(historic)
+
+# Plotting time series
+flow_plot <- ggplot(historic, aes(x = Date, y = Flow)) +
+  geom_line(color = "steelblue") +
+  labs(title = "Monthly Streamflow of Poudre River (2013-2023)",
+       x = "Date",
+       y = "Flow (cfs)") +
+  theme_minimal()
+
+ggplotly(flow_plot)
+
+# Subseries
+gg_subseries(historic_t, Flow)
+```
+
+The subseries plot shows streamflow patterns by month. In this plot, "seasons" are defined as months. There is a clear seasonal pattern with higher flows observed in May and June, which is consistent with snowmelt patterns and peak runoff seasons. I think that the "subseries" represents our time series data broken down further by month. Instead of looking at how flows have changed over time, we are now looking at how flows have changed over time within each month. 
+
+```{r}
+# STL decomposition
+flow_stl <- historic_t %>%
+  model(stl = feasts::STL(Flow ~ season(window = "periodic")))
+
+# Extract and plot components
+flow_components <- components(flow_stl)
+autoplot(flow_components)
+```
+
+I chose to use window = "periodic" because this assumes the same seasonal pattern each year, which is appropriate for hydological data, especially in this case where it follows the annual snowmelt cycle. The plot of the STL decomposition shows that the flows follow a seasonal pattern (shown by the season_year component) consistent across years with peak flow occuring in May and June. This is typical of Western rivers like the Poudre that are fed from mountain snowmelt. Additionally, the trend component, which represents long-term trends in flow, shows a downward trend in flow over time. This is consistent with my knowledge of snowpack, which has been declining in recent years. 
+
+# **Modeltime Prediction**
+
+## ***Data Prep***
+```{r}
+# Historic data prep
+historic_df <- historic %>%
+  mutate(date = as.Date(Date),
+         ppt = as.numeric(ppt),
+         srad = as.numeric(srad),
+         tmax = as.numeric(tmax),
+         Flow = as.numeric(Flow)) %>%
+  select(date, ppt, srad, tmax, Flow) %>%
+  drop_na() %>%
+  as_tibble()
+
+# Future data prep
+future_df <- future %>%
+  mutate(date = as.Date(Date),
+         ppt = as.numeric(ppt),
+         srad = as.numeric(srad),
+         tmax = as.numeric(tmax)) %>%
+  select(date, ppt, srad, tmax) %>%
+  drop_na() %>%
+  as_tibble()
+
+# Time-based train and test split
+set.seed(123)
+
+# Defining splits
+splits <- time_series_split(
+  data = historic_df,
+  date_var = date,
+  assess = "24 months",
+  cumulative = TRUE
+)
+
+# Assigning to train/test
+train_data <- training(splits)
+test_data <- testing(splits)
+```
+
+## ***Model Definition***
+```{r}
+# ARIMA
+model_arima <- arima_reg() %>%
+  set_engine("auto_arima")
+
+# Prophet
+model_prophet <- prophet_reg() %>%
+  set_engine("prophet")
+
+# Linear regression (with climate features)
+model_lm <- linear_reg() %>%
+  set_engine("lm")
+
+# Storing as list
+model_list <- list(
+  arima   = model_arima,
+  prophet = model_prophet,
+  lm      = model_lm
+)
+```
+
+## ***Model Fitting***
+
+I chose to use the month component of the date object and the following climate variables: precipitation (ppt), solar radiation (srad), and max temperature (tmax).
+
+```{r}
+# Flow formula
+flow_formula <- Flow ~ date + ppt + srad + tmax
+
+# Fit models using map
+model_fits <- model_list %>%
+  map(~ fit(.x, formula = flow_formula, data = train_data))
+
+# Conveting to modeltime table
+models_tbl <- model_fits %>%
+  as_modeltime_table()
+```
+
+## ***Model Calibration***
+```{r}
+# Calibrate using test data
+calibration_tbl <- models_tbl %>%
+  modeltime_calibrate(new_data = test_data)
+
+# Assess accuracy
+model_accuracy <- calibration_tbl %>%
+  modeltime_accuracy()
+print(model_accuracy)
+```
+Out of the three models, the linear model performed the worst acorss the board and can only explain about half of the variance in flow, which is to be expected due to non-linear hydrologic relationships (flow and rainfall, for example). The other two models, ARIMA and Prophet, performed bettter and were able to explain more of the variance in flow. The ARIMA model had the lowest mean absolute error (MAE) and mean absolute percentage error (MAPE), but was still off by a lot; on average, the predictions from the ARIMA model were off by ~242% of the actual value.
+
+## ***Model Forecast***
+```{r}
+# Forecasting
+forecast_tbl <- calibration_tbl %>%
+  modeltime_forecast(new_data = test_data, actual_data = historic_df)
+
+# Plotting forecasts
+forecast_tbl %>%
+  plot_modeltime_forecast(
+    .legend_show = TRUE,
+    .title = "Forecasted vs Actual Streamflow",
+    .y_lab = "Flow (cfs)",
+    .x_lab = "Date"
+  )
+```
+
+## ***Refitting the Model***
+```{r}
+# Refit on full dataset
+refit_tbl <- calibration_tbl %>%
+  modeltime_refit(data = historic_df)
+
+# Assess accuracy
+refit_accuracy <- refit_tbl %>%
+  modeltime_accuracy()
+print(refit_accuracy)
+
+# Same models? no...
+calibration_tbl$.model[[1]]
+refit_tbl$.model[[1]]
+```
+
+I'm not sure why the accuracy is exactly the same as before. I've spent some time (> 30 min) trying to figure it out, but it's not clear. I confrimed that they are different models, so it should be okay moving forward...
+
+## ***Looking into the future***
+```{r}
+# Forecast into the future!
+future_forecast <- refit_tbl %>%
+  modeltime_forecast(
+    new_data = future_df,
+    actual_data = historic_df
+  )
+
+# Plot
+future_forecast %>%
+  plot_modeltime_forecast(
+    .title = "Forecasted Streamflow (2024–2033)",
+    .y_lab = "Flow (cfs)",
+    .x_lab = "Date",
+    .legend_show = TRUE
+  )
+```
+
+I think the predictions are genreally reasonable, but flawed. The LM model has the least amount of variability and predicts consistently low flows. The models also consistently predict negative flows, which is not realistic. The ARMIA and Prophet models do significantly better than the LM model, but are still less variable than the historical data. That said, the confidence intervals seem reasonable (at least for values > 0). I think that future streamflow will be most similar to the predictions generated from the ARIMA model. 
